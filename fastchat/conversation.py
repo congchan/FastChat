@@ -61,7 +61,13 @@ class Conversation:
 
     def get_prompt(self) -> str:
         """Get the prompt for generation."""
-        system_prompt = self.system_template.format(system_message=self.system_message)
+        if self.system_message:
+            system_prompt = self.system_template.format(
+                system_message=self.system_message
+            )
+        else:
+            system_prompt = ""
+
         if self.sep_style == SeparatorStyle.ADD_COLON_SINGLE:
             ret = system_prompt + self.sep
             for role, message in self.messages:
