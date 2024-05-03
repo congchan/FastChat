@@ -336,9 +336,26 @@ class Conversation:
         """return the system message."""
         return self.system_message
 
+    def clear_system_message(self):
+        self.system_message = ""
+
+    def reduce_context(self, k):
+        del self.messages[3: 3+k]
+
+    def is_assistant_turn(self, role, vtype=None):
+        if vtype and vtype in ("bot_query", "bot_action"):
+            return True
+        if role.lower() in (self.assistant_role.lower(), self.roles[-1].lower()):
+            return True
+        return False
+
     def append_message(self, role: str, message: str):
         """Append a new message."""
         self.messages.append([role, message])
+
+    def append_message_with_type(self, role: str, message: str, vtype: str = None):
+        """Append a new message."""
+        self.messages.append([role, message, vtype])
 
     def update_last_message(self, message: str):
         """Update the last output.
@@ -412,6 +429,56 @@ class Conversation:
             else:
                 if msg is not None:
                     ret.append({"role": "assistant", "content": msg})
+        return ret
+
+    def to_baichuan_api_messages(self):
+        """Convert the conversation to OpenAI chat completion format."""
+        ret = []
+        for i, messages_tuple in enumerate(self.messages[self.offset :]):
+            if len(messages_tuple) == 3:
+                (role, msg, vtype) = messages_tuple
+            else:
+                vtype = None
+                (role, msg) = messages_tuple
+            if not self.is_assistant_turn(role, vtype):
+                ret.append({"role": "user", "content": msg})
+            else:
+                if msg is not None:
+                    ret.append({"role": "assistant", "content": msg})
+
+        if ret[0]["role"] != "user":
+            ret.insert(0, {"role": "user", "content": " "})
+        elif not ret[0]["content"]:
+            ret[0]["content"] = " "
+        return ret
+
+    def to_minimax_api_messages(self):
+        """
+        Convert the conversation to Minimax chat completion format.
+        {"sender_type": "USER", "sender_name": "用户", "text": "Hi"}
+        """
+        ret = []
+        user_role_name = None
+        bot_role_name = None
+        for i, messages_tuple in enumerate(self.messages[self.offset :]):
+            if len(messages_tuple) == 3:
+                (role, message, vtype) = messages_tuple
+            else:
+                raise ValueError(
+                    f"Minimax's chat messages required three elements, but got {len(messages_tuple)}"
+                )
+            if vtype.lower().startswith("user"):
+                ret.append(
+                    {"sender_type": "USER", "sender_name": role, "text": message}
+                )
+                user_role_name = role
+            elif message is not None:
+                ret.append({"sender_type": "BOT", "sender_name": role, "text": message})
+                bot_role_name = role
+
+        if ret[0]["sender_type"] != "USER":
+            ret.insert(0, {"sender_type": "USER", "sender_name": user_role_name, "text": ""})
+
         return ret
 
     def extract_text_from_messages(self):

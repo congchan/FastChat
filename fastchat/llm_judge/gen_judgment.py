@@ -116,8 +116,6 @@ def make_match_single(
 ):
     matches = []
     for q in questions:
-        if multi_turn and len(q["turns"]) != 2:
-            continue
         for i in range(len(models)):
             q_id = q["question_id"]
             m = models[i]
@@ -163,7 +161,36 @@ def make_judge_single(judge_model, judge_prompts):
         ref_based=True,
         multi_turn=True,
     )
+    judges["more-mt-overall"] = Judge(
+        judge_model, judge_prompts["single-v1-more-turn-overall"], multi_turn=True
+    )
+    judges["more-mt-consistency"] = Judge(
+        judge_model, judge_prompts["single-v1-more-turn-consistency"], multi_turn=True
+    )
+    judges["more-mt-pragmatics"] = Judge(
+        judge_model, judge_prompts["single-v1-more-turn-pragmatics"], multi_turn=True
+    )
+    judges["more-mt-adaptability"] = Judge(
+        judge_model, judge_prompts["single-v1-more-turn-adaptability"], multi_turn=True
+    )
+    judges["more-mt-stability"] = Judge(
+        judge_model, judge_prompts["single-v1-more-turn-stability"], multi_turn=True
+    )
+    judges["more-mt-acting"] = Judge(
+        judge_model, judge_prompts["single-v1-more-turn-acting"], multi_turn=True
+    )
+    judges["more-mt-acting-bucket"] = Judge(
+        judge_model, judge_prompts["single-v1-more-turn-acting-bucket"], multi_turn=True
+    )
+    judges["more-mt-calls-chitchat"] = Judge(
+        judge_model, judge_prompts["single-v1-more-turn-calls-chitchat"], multi_turn=True
+    )
+
     return judges
+
+
+def sort_matches(matches):
+    matches.sort(key=lambda x: x.question["question_id"])
 
 
 if __name__ == "__main__":
@@ -181,6 +208,9 @@ if __name__ == "__main__":
         help="The file of judge prompts.",
     )
     parser.add_argument("--judge-model", type=str, default="gpt-4")
+    parser.add_argument("--max-tokens", type=int, default=1024)
+    parser.add_argument("--judge-times", type=int, default=1, help="The number of judges, for agreement checking.")
+    parser.add_argument("--api-key", type=str, default=None)
     parser.add_argument("--baseline-model", type=str, default="gpt-3.5-turbo")
     parser.add_argument(
         "--mode",
@@ -195,6 +225,38 @@ if __name__ == "__main__":
         ),
     )
     parser.add_argument(
+        "--more-turn-dimensions",
+        type=str,
+        nargs="+",
+        default=None,
+        help=(
+            "Self developed evaluation dimension for more than two turns. "
+            "Only compatible with --mode single. "
+            "Supported dimensions includes:"
+            "   more-mt-overall,"
+            "   more-mt-consistency,"
+            "   more-mt-helpfulness,"
+            "   more-mt-creativity,"
+            "   more-mt-relevance,"
+            "   more-mt-fluency,"
+            "   more-mt-pragmatics,"
+            "   more-mt-adaptability,"
+            "   more-mt-stability,"
+            "   more-mt-acting,"
+            "   more-mt-acting-plus,"
+            "   more-mt-acting-bucket,"
+            "   more-mt-acting-fraction,"
+            "   more-mt-calls,"
+            "   more-mt-calls-chitchat,"
+        ),
+    )
+    parser.add_argument(
+        "--system-keys",
+        type=str,
+        nargs="+",
+        default=None
+    )
+    parser.add_argument(
         "--model-list",
         type=str,
         nargs="+",
@@ -205,7 +267,12 @@ if __name__ == "__main__":
         "--parallel", type=int, default=1, help="The number of concurrent API calls."
     )
     parser.add_argument(
-        "--first-n", type=int, help="A debug option. Only run the first `n` judgments."
+        "--begin-id", type=int, help="A debug option. Only run from begin-id index."
+    )
+    parser.add_argument(
+        "--end-id",
+        type=int,
+        help="A debug option. Only run from begin-id index to end-id index.",
     )
     args = parser.parse_args()
 
@@ -223,8 +290,16 @@ if __name__ == "__main__":
     # Load judge
     judge_prompts = load_judge_prompts(args.judge_file)
 
-    if args.first_n:
-        questions = questions[: args.first_n]
+    if (
+        args.begin_id is not None
+        and int(args.begin_id) >= 1
+        and args.end_id is not None
+        and int(args.end_id) >= 1
+    ):
+        print(
+            f"Judge for {question_file}, from question id {args.begin_id} to {args.end_id}."
+        )
+        questions = questions[args.begin_id - 1: args.end_id]
 
     if args.model_list is None:
         models = get_model_list(answer_dir)
@@ -288,14 +363,57 @@ if __name__ == "__main__":
         multi_turn=True,
     )
 
+    if args.more_turn_dimensions:  # ["more-mt"]
+        print(
+            f"Use our own developed evaluation dimension. "
+            f"Compatible with any numbers of turns. "
+            f"Only compatible with --mode single which is the default mode. "
+        )
+        matches = []
+        for more_turn_dimension in args.more_turn_dimensions:
+            matches += make_match_func(
+                question_default,
+                models,
+                model_answers,
+                judges[more_turn_dimension],
+                baseline_model,
+                multi_turn=True,
+            )
+
+    sort_matches(matches)
+    # Filter out existed matches
+    total_num_matches = len(matches)
+    filtered_matches = []
+    try:
+        with open(output_file, "r") as f:
+            existed_matches = [json.loads(line) for line in f]
+    except FileNotFoundError:
+        existed_matches = []
+    uniq_ids = set(
+        [
+            f"{e['question_id']}_{e['model']}_{e['judge'][0]}_{e['judge'][1]}_{e['turn']}"
+            for e in existed_matches
+        ]
+    )
+    for match in matches:
+        turn = 2 if match.judge.multi_turn else 1
+        uniq_id = f"{match.question['question_id']}_{match.answer['model_id']}_{match.judge.model_name}_{match.judge.prompt_template['name']}_{turn}"
+        if uniq_id in uniq_ids:
+            print(f"Skip {uniq_id}")
+        else:
+            filtered_matches.append(match)
+    matches = filtered_matches
+
     match_stat = {}
     match_stat["bench_name"] = args.bench_name
     match_stat["mode"] = args.mode
     match_stat["judge"] = args.judge_model
+    match_stat["dimension"] = args.more_turn_dimensions
     match_stat["baseline"] = baseline_model
     match_stat["model_list"] = models
     match_stat["total_num_questions"] = len(questions)
     match_stat["total_num_matches"] = len(matches)
+    match_stat["total_num_judge"] = len(matches) * args.judge_times
     match_stat["output_path"] = output_file
 
     # Show match stats and prompt enter to continue
@@ -303,20 +421,32 @@ if __name__ == "__main__":
     print(json.dumps(match_stat, indent=4))
     input("Press Enter to confirm...")
 
+    api_dict = {"api_key": args.api_key}
     # Play matches
     if args.parallel == 1:
-        for match in tqdm(matches):
-            play_a_match_func(match, output_file=output_file)
+        for t in range(args.judge_times):
+            for match in tqdm(matches):
+                play_a_match_func(
+                    match, output_file=output_file, system_keys=args.system_keys,
+                    api_dict=api_dict,
+                    max_tokens=args.max_tokens,
+                    judge_time=t
+                )
     else:
-
-        def play_a_match_wrapper(match):
-            play_a_match_func(match, output_file=output_file)
-
         np.random.seed(0)
         np.random.shuffle(matches)
 
         with ThreadPoolExecutor(args.parallel) as executor:
-            for match in tqdm(
-                executor.map(play_a_match_wrapper, matches), total=len(matches)
-            ):
-                pass
+            for t in range(args.judge_times):
+                def play_a_match_wrapper(match):
+                    play_a_match_func(
+                        match, output_file=output_file, system_keys=args.system_keys,
+                        api_dict=api_dict,
+                        max_tokens=args.max_tokens,
+                        judge_time=t
+                    )
+
+                for match in tqdm(
+                    executor.map(play_a_match_wrapper, matches), total=len(matches)
+                ):
+                    pass

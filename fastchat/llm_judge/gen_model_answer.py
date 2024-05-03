@@ -7,21 +7,30 @@ import argparse
 import json
 import os
 import random
+import re
 import time
 
 import shortuuid
 import torch
 from tqdm import tqdm
 
-from fastchat.llm_judge.common import load_questions, temperature_config
-from fastchat.model import load_model, get_conversation_template
-from fastchat.utils import str_to_torch_dtype
+from fastchat.llm_judge.common import (
+    load_questions,
+    temperature_config,
+    get_questions,
+    get_system,
+    API_LEN_ERROR_OUTPUT,
+)
+from fastchat.model import load_model, make_conv_template, load_model_config
+from fastchat.utils import str_to_torch_dtype, get_context_length
 
 
 def run_eval(
     model_path,
     model_id,
+    conv_template,
     question_file,
+    system_key,
     question_begin,
     question_end,
     answer_file,
@@ -31,6 +40,7 @@ def run_eval(
     num_gpus_total,
     max_gpu_memory,
     dtype,
+    repetition_penalty,
     revision,
 ):
     questions = load_questions(question_file, question_begin, question_end)
@@ -55,13 +65,16 @@ def run_eval(
             get_answers_func(
                 model_path,
                 model_id,
+                conv_template,
                 questions[i : i + chunk_size],
+                system_key,
                 answer_file,
                 max_new_token,
                 num_choices,
                 num_gpus_per_model,
                 max_gpu_memory,
                 dtype=dtype,
+                repetition_penalty=repetition_penalty,
                 revision=revision,
             )
         )
@@ -70,17 +83,47 @@ def run_eval(
         ray.get(ans_handles)
 
 
+category_with_role = ("Stability",)
+
+
+def remove_corrupted_tokens(output):
+    """Tempt fix for error when context is too long"""
+    pattern_for_corrupted = "\n{4,}|�|\n\.{2,}"
+    output = re.sub(pattern_for_corrupted, "", output)
+    return output
+
+
+def prune_input_ids(conv, tokenizer, max_input_length):
+    while len(input_ids := tokenizer(conv.get_prompt()).input_ids) > max_input_length:
+        if len(conv.messages) > 2:
+            conv.reduce_context(2)
+            print(
+                f"Try reduce context to fit in the model context length {max_input_length}. "
+                f"Remove first 2 turns, left {conv.get_num_messages()} turns."
+            )
+        else:
+            print("Stop reducing context.")
+            break
+
+    input_ids = [input_ids]
+
+    return input_ids
+
+
 @torch.inference_mode()
 def get_model_answers(
     model_path,
     model_id,
+    conv_template,
     questions,
+    system_key,
     answer_file,
     max_new_token,
     num_choices,
     num_gpus_per_model,
     max_gpu_memory,
     dtype,
+    repetition_penalty,
     revision,
 ):
     model, tokenizer = load_model(
@@ -94,6 +137,8 @@ def get_model_answers(
         cpu_offloading=False,
         debug=False,
     )
+    config = load_model_config(model_path)
+    max_context_length = get_context_length(config)
 
     for question in tqdm(questions):
         if question["category"] in temperature_config:
@@ -104,14 +149,37 @@ def get_model_answers(
         choices = []
         for i in range(num_choices):
             torch.manual_seed(i)
-            conv = get_conversation_template(model_id)
+            conv = make_conv_template(conv_template, model_path)
             turns = []
-            for j in range(len(question["turns"])):
-                qs = question["turns"][j]
-                conv.append_message(conv.roles[0], qs)
-                conv.append_message(conv.roles[1], None)
-                prompt = conv.get_prompt()
-                input_ids = tokenizer([prompt]).input_ids
+            qss = get_questions(question)
+            if question["category"] in category_with_role:
+                system_p = get_system(question, model_id, system_key)
+                conv.set_system_message(system_p)
+            if (
+                len(qss) > 1
+                and isinstance(qss[0], dict)
+                and qss[0]["type"] in ("bot_intro",)
+            ):
+                bot_intro_turn = qss[0]
+                conv.append_message(conv.roles[1], bot_intro_turn["value"])
+                qss = qss[1:]
+
+            for j in range(len(qss)):
+                qs = qss[j]
+                assistant_content = None
+                if question["category"] in category_with_role or (
+                    isinstance(qs, dict) and "from" in qs
+                ):
+                    assistant_role = conv.roles[1]
+                    conv.append_message(qs["from"], qs["value"])
+                    conv.append_message(assistant_role, assistant_content)
+                else:
+                    conv.append_message(conv.roles[0], qs)
+                    conv.append_message(conv.roles[1], assistant_content)
+
+                input_ids = prune_input_ids(
+                    conv, tokenizer, max_context_length - max_new_token
+                )
 
                 if temperature < 1e-4:
                     do_sample = False
@@ -125,6 +193,7 @@ def get_model_answers(
                         do_sample=do_sample,
                         temperature=temperature,
                         max_new_tokens=max_new_token,
+                        repetition_penalty=repetition_penalty,
                     )
                     if model.config.is_encoder_decoder:
                         output_ids = output_ids[0]
@@ -164,6 +233,8 @@ def get_model_answers(
                                 output = output.replace(special_tok, "")
                         else:
                             output = output.replace(special_token, "")
+
+                    output = remove_corrupted_tokens(output)
                     output = output.strip()
 
                     if conv.name == "xgen" and output.startswith("Assistant:"):
@@ -179,15 +250,16 @@ def get_model_answers(
 
         # Dump answers
         os.makedirs(os.path.dirname(answer_file), exist_ok=True)
-        with open(os.path.expanduser(answer_file), "a") as fout:
+        with open(os.path.expanduser(answer_file), "a", encoding="utf-8") as fout:
             ans_json = {
                 "question_id": question["question_id"],
+                "category": question["category"],
                 "answer_id": shortuuid.uuid(),
                 "model_id": model_id,
                 "choices": choices,
                 "tstamp": time.time(),
             }
-            fout.write(json.dumps(ans_json) + "\n")
+            fout.write(json.dumps(ans_json, ensure_ascii=False) + "\n")
 
 
 def reorg_answer_file(answer_file):
@@ -216,11 +288,15 @@ if __name__ == "__main__":
         "--model-id", type=str, required=True, help="A custom name for the model."
     )
     parser.add_argument(
+        "--conv-template", type=str, default=None, help="Conversation prompt template."
+    )
+    parser.add_argument(
         "--bench-name",
         type=str,
         default="mt_bench",
         help="The name of the benchmark question set.",
     )
+    parser.add_argument("--system-key", type=str, default=None, help="The key to extract system prompt.")
     parser.add_argument(
         "--question-begin",
         type=int,
@@ -235,6 +311,12 @@ if __name__ == "__main__":
         type=int,
         default=1024,
         help="The maximum number of new generated tokens.",
+    )
+    parser.add_argument(
+        "--repetition-penalty",
+        type=float,
+        default=1.0,
+        help="The parameter for repetition penalty. 1.0 means no penalty.",
     )
     parser.add_argument(
         "--num-choices",
@@ -288,7 +370,9 @@ if __name__ == "__main__":
     run_eval(
         model_path=args.model_path,
         model_id=args.model_id,
+        conv_template=args.conv_template,
         question_file=question_file,
+        system_key=args.system_key,
         question_begin=args.question_begin,
         question_end=args.question_end,
         answer_file=answer_file,
@@ -298,6 +382,7 @@ if __name__ == "__main__":
         num_gpus_total=args.num_gpus_total,
         max_gpu_memory=args.max_gpu_memory,
         dtype=str_to_torch_dtype(args.dtype),
+        repetition_penalty=args.repetition_penalty,
         revision=args.revision,
     )
 
